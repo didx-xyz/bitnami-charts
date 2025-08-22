@@ -34,13 +34,15 @@ jobs:
       has-changes: ${{ steps.sync.outputs.has-changes }}
       local-commit: ${{ steps.sync.outputs.local-commit }}
       upstream-commit: ${{ steps.sync.outputs.upstream-commit }}
+      matrix: ${{ steps.discover.outputs.matrix }}
+      charts-count: ${{ steps.discover.outputs.charts-count }}
     permissions:
       contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: true
           ref: main
           token: ${{ github.token }}
@@ -50,8 +52,6 @@ jobs:
           git remote add upstream https://github.com/bitnami/charts.git || true
           git remote set-url upstream https://github.com/bitnami/charts.git
 
-      - run: git fetch --all --tags
-
       - name: Sync with upstream
         id: sync
         env:
@@ -60,12 +60,10 @@ jobs:
           # Determine target ref and fetch appropriate upstream changes
           if [ -n "${UPSTREAM_REF}" ]; then
             echo "Using specified upstream ref: ${UPSTREAM_REF}"
-            echo "Note: Tags will not be synced when using manual upstream_ref"
             git fetch upstream "${UPSTREAM_REF}"
             target_ref="${UPSTREAM_REF}"
           else
             echo "Using latest upstream main"
-            echo "Tags will be synced from upstream"
             # Fetch main branch
             git fetch upstream main
             target_ref="upstream/main"
@@ -98,37 +96,19 @@ jobs:
             echo "has-changes=false" >> $GITHUB_OUTPUT
           fi
 
-          # Sync tags from upstream, but only if no specific upstream ref was provided
-          if [ -z "${UPSTREAM_REF}" ]; then
-            echo "🏷️ Syncing new tags from upstream..."
+          echo "Successfully synced with $target_ref preserving authorship"
 
-            git push origin --tags
+      - name: Fetch all tags
+        run: git fetch --all --unshallow --tags
+        if: steps.sync.outputs.has-changes == 'true'
 
-            echo "Successfully synced with $target_ref preserving authorship and tags"
-          else
-            echo "Successfully synced with $target_ref preserving authorship (tags not synced)"
-          fi
-
-  discover-charts:
-    runs-on: ubuntu-24.04
-    name: Discover changed charts
-    needs: sync-upstream
-    if: needs.sync-upstream.outputs.has-changes == 'true'
-    outputs:
-      matrix: ${{ steps.discover.outputs.matrix }}
-      charts-count: ${{ steps.discover.outputs.charts-count }}
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-        with:
-          ref: main
-          persist-credentials: false
-          fetch-depth: 0
+      - name: Sync tags
+        if: steps.sync.outputs.has-changes == 'true'
+        run: git push origin --tags
 
       - name: Discover changed charts
         id: discover
+        if: steps.sync.outputs.has-changes == 'true'
         run: |
           echo "Comparing commits from sync operation:"
           echo "  Base (local before sync): $BASE_COMMIT"
@@ -215,19 +195,19 @@ jobs:
           echo "Changed charts matrix:"
           echo "$matrix_json" | jq .
         env:
-          BASE_COMMIT: ${{ needs.sync-upstream.outputs.local-commit }}
-          TARGET_COMMIT: ${{ needs.sync-upstream.outputs.upstream-commit }}
+          BASE_COMMIT: ${{ steps.sync.outputs.local-commit }}
+          TARGET_COMMIT: ${{ steps.sync.outputs.upstream-commit }}
 
   build:
     name: Package and Push ${{ matrix.chart.name }}
     runs-on: ubuntu-24.04
-    needs: [sync-upstream, discover-charts]
-    if: needs.sync-upstream.outputs.has-changes == 'true' && needs.discover-charts.outputs.charts-count != '0'
+    needs: sync-upstream
+    if: needs.sync-upstream.outputs.has-changes == 'true' && needs.sync-upstream.outputs.charts-count != '0'
     strategy:
       fail-fast: true
       max-parallel: 10
       matrix:
-        chart: ${{ fromJSON(needs.discover-charts.outputs.matrix) }}
+        chart: ${{ fromJSON(needs.sync-upstream.outputs.matrix) }}
 
     permissions:
       contents: read
@@ -432,7 +412,7 @@ jobs:
   build-summary:
     runs-on: ubuntu-24.04
     name: Build Summary
-    needs: [sync-upstream, discover-charts, build]
+    needs: [sync-upstream, build]
     if: always()
     steps:
       - name: Generate summary
@@ -477,7 +457,7 @@ jobs:
           echo "*This workflow automatically syncs with [bitnami/charts](https://github.com/bitnami/charts) and packages only changed Helm charts.*" >> $GITHUB_STEP_SUMMARY
         env:
           BUILD_RESULT: ${{ needs.build.result }}
-          CHART_COUNT: ${{ needs.discover-charts.outputs.charts-count }}
+          CHART_COUNT: ${{ needs.sync-upstream.outputs.charts-count }}
           HAS_CHANGES: ${{ needs.sync-upstream.outputs.has-changes }}
 
       - name: Report status
@@ -491,13 +471,13 @@ jobs:
           fi
         env:
           BUILD_RESULT: ${{ needs.build.result }}
-          CHART_COUNT: ${{ needs.discover-charts.outputs.charts-count }}
+          CHART_COUNT: ${{ needs.sync-upstream.outputs.charts-count }}
           HAS_CHANGES: ${{ needs.sync-upstream.outputs.has-changes }}
 
   rollback-on-failure:
     runs-on: ubuntu-24.04
     name: Rollback main branch on build failure
-    needs: [sync-upstream, discover-charts, build]
+    needs: [sync-upstream, build]
     if: failure() && needs.sync-upstream.outputs.has-changes == 'true'
     permissions:
       contents: write
