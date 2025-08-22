@@ -8,12 +8,12 @@ on:
   workflow_dispatch:
     inputs:
       upstream_ref:
-        description: "Upstream commit hash or ref to sync to (leave empty for latest main)"
+        description: Upstream commit hash or ref to sync to (leave empty for latest main)
         required: false
         type: string
         default: ""
       rewrite_dependencies:
-        description: "Rewrite Chart.yaml dependencies to use our registry instead of Bitnami's"
+        description: Rewrite Chart.yaml dependencies
         required: false
         type: boolean
         default: false
@@ -40,7 +40,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
-          fetch-depth: 1
+          fetch-depth: 0
           persist-credentials: true
           ref: main
           token: ${{ github.token }}
@@ -50,6 +50,8 @@ jobs:
           git remote add upstream https://github.com/bitnami/charts.git || true
           git remote set-url upstream https://github.com/bitnami/charts.git
 
+      - run: git fetch --all --tags
+
       - name: Sync with upstream
         id: sync
         env:
@@ -58,10 +60,13 @@ jobs:
           # Determine target ref and fetch appropriate upstream changes
           if [ -n "${UPSTREAM_REF}" ]; then
             echo "Using specified upstream ref: ${UPSTREAM_REF}"
-            git fetch upstream "${UPSTREAM_REF}" || git fetch upstream
+            echo "Note: Tags will not be synced when using manual upstream_ref"
+            git fetch upstream "${UPSTREAM_REF}"
             target_ref="${UPSTREAM_REF}"
           else
             echo "Using latest upstream main"
+            echo "Tags will be synced from upstream"
+            # Fetch main branch
             git fetch upstream main
             target_ref="upstream/main"
           fi
@@ -88,10 +93,20 @@ jobs:
             git push origin main --force-with-lease
 
             echo "has-changes=true" >> $GITHUB_OUTPUT
-            echo "Successfully synced with $target_ref preserving authorship"
           else
             echo "No changes detected - already at target commit"
             echo "has-changes=false" >> $GITHUB_OUTPUT
+          fi
+
+          # Sync tags from upstream, but only if no specific upstream ref was provided
+          if [ -z "${UPSTREAM_REF}" ]; then
+            echo "🏷️ Syncing new tags from upstream..."
+
+            git push origin --tags
+
+            echo "Successfully synced with $target_ref preserving authorship and tags"
+          else
+            echo "Successfully synced with $target_ref preserving authorship (tags not synced)"
           fi
 
   discover-charts:
@@ -260,45 +275,54 @@ jobs:
         run: |
           echo "${{ github.token }}" | helm registry login ghcr.io -u ${{ github.repository_owner }} --password-stdin
 
-      - name: Update chart dependencies
-        if: steps.verify-chart.outputs.exists == 'true' && steps.verify-chart.outputs.valid == 'true' && github.event.inputs.rewrite_dependencies == 'true'
+      - name: Build chart dependencies
+        if: steps.verify-chart.outputs.exists == 'true' && steps.verify-chart.outputs.valid == 'true'
+        env:
+          REWRITE_DEPENDENCIES: ${{ github.event.inputs.rewrite_dependencies }}
         run: |
           chart_dir="${{ matrix.chart.chart_dir }}"
           chart_file="${{ matrix.chart.chart_file }}"
           chart_name="${{ matrix.chart.name }}"
+          rewrite_deps="${REWRITE_DEPENDENCIES:-false}"
 
-          echo "🔄 Rewriting chart dependencies to use our registry (enabled by workflow input)"
-          echo "Chart: $chart_name"
-          echo "Chart file: $chart_file"
+          echo "🔧 Managing chart dependencies for: $chart_name"
+          echo "Rewrite dependencies: ${rewrite_deps:-false}"
 
-          # Backup original Chart.yaml
-          cp "$chart_file" "$chart_file.backup"
-
-          # Replace Bitnami registry URLs with our own
-          # Replace both possible Bitnami registry URLs
-          sed -i 's|oci://registry-1\.docker\.io/bitnamicharts|oci://ghcr.io/${{ github.repository_owner }}/bitnami-oss-charts|g' "$chart_file"
-          sed -i 's|https://charts\.bitnami\.com/bitnami|oci://ghcr.io/${{ github.repository_owner }}/bitnami-oss-charts|g' "$chart_file"
-
-          echo "📝 Updated Chart.yaml dependencies:"
-          if command -v yq >/dev/null 2>&1; then
-            echo "Dependencies in Chart.yaml:"
-            yq eval '.dependencies[] | "- " + .name + " from " + .repository' "$chart_file" || echo "No dependencies found"
-          else
-            echo "Dependencies found:"
-            grep -A 5 "dependencies:" "$chart_file" || echo "No dependencies section found"
+          # Check if Chart.yaml has dependencies
+          if ! grep -q "dependencies:" "$chart_file"; then
+            echo "ℹ️ No dependencies found in Chart.yaml, skipping dependency management"
+            exit 0
           fi
 
-          # Remove existing Chart.lock if it exists (we'll regenerate it)
-          chart_lock="$chart_dir/Chart.lock"
-          if [ -f "$chart_lock" ]; then
-            echo "🗑️ Removing existing Chart.lock file"
-            rm "$chart_lock"
-          fi
+          if [ "$rewrite_deps" = "true" ]; then
+            echo "🔄 Rewriting chart dependencies to use our registry (enabled by workflow input)"
+            echo "Chart file: $chart_file"
 
-          # Update dependencies if Chart.yaml has dependencies
-          if grep -q "dependencies:" "$chart_file"; then
+            # Backup original Chart.yaml
+            cp "$chart_file" "$chart_file.backup"
+
+            # Replace Bitnami registry URLs with our own
+            # Replace both possible Bitnami registry URLs
+            sed -i 's|oci://registry-1\.docker\.io/bitnamicharts|oci://ghcr.io/${{ github.repository_owner }}/bitnami-oss-charts|g' "$chart_file"
+            sed -i 's|https://charts\.bitnami\.com/bitnami|oci://ghcr.io/${{ github.repository_owner }}/bitnami-oss-charts|g' "$chart_file"
+
+            echo "📝 Updated Chart.yaml dependencies:"
+            if command -v yq >/dev/null 2>&1; then
+              echo "Dependencies in Chart.yaml:"
+              yq eval '.dependencies[] | "- " + .name + " from " + .repository' "$chart_file" || echo "No dependencies found"
+            else
+              echo "Dependencies found:"
+              grep -A 5 "dependencies:" "$chart_file" || echo "No dependencies section found"
+            fi
+
+            # Remove existing Chart.lock if it exists (we'll regenerate it)
+            chart_lock="$chart_dir/Chart.lock"
+            if [ -f "$chart_lock" ]; then
+              echo "🗑️ Removing existing Chart.lock file"
+              rm "$chart_lock"
+            fi
+
             echo "🔄 Updating chart dependencies from our registry"
-
             # Run helm dependency update to fetch from our registry
             if helm dependency update "$chart_dir"; then
               echo "✅ Successfully updated dependencies"
@@ -313,7 +337,27 @@ jobs:
               echo "This might be expected if dependencies haven't been published yet"
             fi
           else
-            echo "ℹ️ No dependencies found in Chart.yaml, skipping dependency update"
+            echo "🔨 Building chart dependencies using existing Chart.lock (rewrite_dependencies=false)"
+
+            # Check if Chart.lock exists
+            chart_lock="$chart_dir/Chart.lock"
+            if [ -f "$chart_lock" ]; then
+              echo "✅ Chart.lock found, building dependencies"
+              if helm dependency build "$chart_dir"; then
+                echo "✅ Successfully built dependencies from Chart.lock"
+              else
+                echo "❌ Failed to build dependencies from Chart.lock"
+                exit 1
+              fi
+            else
+              echo "⚠️ No Chart.lock found, running dependency update to generate it"
+              if helm dependency update "$chart_dir"; then
+                echo "✅ Successfully updated and built dependencies"
+              else
+                echo "❌ Failed to update dependencies"
+                exit 1
+              fi
+            fi
           fi
 
       - name: Package Helm chart
@@ -352,19 +396,20 @@ jobs:
 
       - name: Push Helm chart to GHCR
         if: steps.verify-chart.outputs.exists == 'true' && steps.verify-chart.outputs.valid == 'true' && steps.package.outputs.package-file != ''
+        env:
+          PACKAGE_FILE: ${{ steps.package.outputs.package-file }}
+          PACKAGE_PATH: ${{ steps.package.outputs.package-path }}
         run: |
-          package_file="${{ steps.package.outputs.package-file }}"
-          package_path="${{ steps.package.outputs.package-path }}"
           chart_name="${{ matrix.chart.name }}"
           chart_version="${{ matrix.chart.version }}"
 
           echo "🚀 Pushing Helm chart to GHCR: $chart_name v$chart_version"
-          echo "Package file: $package_file"
-          echo "Package path: $package_path"
+          echo "Package file: ${PACKAGE_FILE}"
+          echo "Package path: ${PACKAGE_PATH}"
           echo "Registry: ghcr.io/${{ github.repository_owner }}/bitnami-oss-charts"
 
           # Push the chart to GHCR using the full path
-          helm push "$package_path" oci://ghcr.io/${{ github.repository_owner }}/bitnami-oss-charts
+          helm push "${PACKAGE_PATH}" oci://ghcr.io/${{ github.repository_owner }}/bitnami-oss-charts
 
           echo "✅ Successfully pushed $chart_name:$chart_version to ghcr.io/${{ github.repository_owner }}/bitnami-oss-charts"
 
