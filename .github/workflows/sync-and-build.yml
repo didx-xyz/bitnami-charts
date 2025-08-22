@@ -1,0 +1,504 @@
+name: Sync and Package Helm Charts
+
+on:
+  # Run daily at midnight UTC
+  schedule:
+    - cron: "0 0 * * *"
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream commit hash or ref to sync to (leave empty for latest main)"
+        required: false
+        type: string
+        default: ""
+      rewrite_dependencies:
+        description: "Rewrite Chart.yaml dependencies to use our registry instead of Bitnami's"
+        required: false
+        type: boolean
+        default: false
+
+permissions: {}
+
+# Prevent concurrent runs
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  ## Always automatically keep `main` in sync with `upstream/main`
+  sync-upstream:
+    runs-on: ubuntu-24.04
+    name: Sync with upstream
+    outputs:
+      has-changes: ${{ steps.sync.outputs.has-changes }}
+      local-commit: ${{ steps.sync.outputs.local-commit }}
+      upstream-commit: ${{ steps.sync.outputs.upstream-commit }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: true
+          ref: main
+          token: ${{ github.token }}
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/bitnami/charts.git || true
+          git remote set-url upstream https://github.com/bitnami/charts.git
+
+      - name: Sync with upstream
+        id: sync
+        env:
+          UPSTREAM_REF: ${{ github.event.inputs.upstream_ref }}
+        run: |
+          # Determine target ref and fetch appropriate upstream changes
+          if [ -n "${UPSTREAM_REF}" ]; then
+            echo "Using specified upstream ref: ${UPSTREAM_REF}"
+            git fetch upstream "${UPSTREAM_REF}" || git fetch upstream
+            target_ref="${UPSTREAM_REF}"
+          else
+            echo "Using latest upstream main"
+            git fetch upstream main
+            target_ref="upstream/main"
+          fi
+
+          # Check if there are any new commits
+          LOCAL=$(git rev-parse HEAD)
+          UPSTREAM=$(git rev-parse "$target_ref")
+
+          echo "Local commit: $LOCAL"
+          echo "Target upstream commit: $UPSTREAM"
+          echo "Target ref: $target_ref"
+
+          # Output the commit hashes for use in later jobs
+          echo "local-commit=$LOCAL" >> $GITHUB_OUTPUT
+          echo "upstream-commit=$UPSTREAM" >> $GITHUB_OUTPUT
+
+          if [ "$LOCAL" != "$UPSTREAM" ]; then
+            echo "Changes detected, syncing to $target_ref..."
+
+            # Reset main branch to match target exactly (preserving authorship)
+            git reset --hard "$UPSTREAM"
+
+            # Push changes to origin main
+            git push origin main --force-with-lease
+
+            echo "has-changes=true" >> $GITHUB_OUTPUT
+            echo "Successfully synced with $target_ref preserving authorship"
+          else
+            echo "No changes detected - already at target commit"
+            echo "has-changes=false" >> $GITHUB_OUTPUT
+          fi
+
+  discover-charts:
+    runs-on: ubuntu-24.04
+    name: Discover changed charts
+    needs: sync-upstream
+    if: needs.sync-upstream.outputs.has-changes == 'true'
+    outputs:
+      matrix: ${{ steps.discover.outputs.matrix }}
+      charts-count: ${{ steps.discover.outputs.charts-count }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: main
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Discover changed charts
+        id: discover
+        run: |
+          echo "Comparing commits from sync operation:"
+          echo "  Base (local before sync): $BASE_COMMIT"
+          echo "  Target (upstream): $TARGET_COMMIT"
+          echo "  Trigger: ${{ github.event_name }}"
+
+          # Get list of changed Chart.yaml files to identify changed charts
+          changed_files=$(git diff --name-only "${BASE_COMMIT}..${TARGET_COMMIT}" | grep "^bitnami/.*/Chart\.yaml$" || true)
+
+          if [ -z "$changed_files" ]; then
+            echo "No Chart.yaml files changed between $BASE_COMMIT and $TARGET_COMMIT"
+            echo "charts-count=0" >> $GITHUB_OUTPUT
+            echo "matrix=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Changed Chart.yaml files between $BASE_COMMIT and $TARGET_COMMIT:"
+          echo "$changed_files"
+
+          # Extract chart information from changed Chart.yaml files
+          charts=()
+
+          while IFS= read -r chart_file; do
+            if [ -n "$chart_file" ] && [ -f "$chart_file" ]; then
+              # Extract chart directory and name
+              chart_dir=$(dirname "$chart_file")
+              chart_name=$(basename "$chart_dir")
+
+              echo "Processing chart: $chart_name at $chart_dir"
+
+              # Extract version from Chart.yaml using yq or grep
+              if command -v yq >/dev/null 2>&1; then
+                chart_version=$(yq eval '.version' "$chart_file" 2>/dev/null || echo "")
+                app_version=$(yq eval '.appVersion' "$chart_file" 2>/dev/null || echo "")
+              else
+                # Fallback to grep if yq is not available
+                chart_version=$(grep "^version:" "$chart_file" | sed 's/version: *//' | tr -d '"' || echo "")
+                app_version=$(grep "^appVersion:" "$chart_file" | sed 's/appVersion: *//' | tr -d '"' || echo "")
+              fi
+
+              if [ -n "$chart_version" ]; then
+                echo "Found chart: $chart_name version $chart_version (app version: $app_version)"
+
+                # Create chart object for the matrix
+                chart_obj=$(jq -n \
+                  --arg name "$chart_name" \
+                  --arg version "$chart_version" \
+                  --arg app_version "$app_version" \
+                  --arg chart_dir "$chart_dir" \
+                  --arg chart_file "$chart_file" \
+                  '{
+                    name: $name,
+                    version: $version,
+                    app_version: $app_version,
+                    chart_dir: $chart_dir,
+                    chart_file: $chart_file
+                  }')
+
+                charts+=("$chart_obj")
+                echo "Added chart to build matrix: $chart_name:$chart_version"
+              else
+                echo "Warning: Could not extract version from $chart_file"
+              fi
+            fi
+          done <<< "$changed_files"
+
+          # Convert to JSON array
+          if [ ${#charts[@]} -eq 0 ]; then
+            matrix_json="[]"
+          else
+            matrix_json=$(printf '%s\n' "${charts[@]}" | jq -s .)
+          fi
+
+          echo "Found ${#charts[@]} changed charts"
+          echo "charts-count=${#charts[@]}" >> $GITHUB_OUTPUT
+
+          # Use a temporary file to avoid issues with special characters in GitHub Actions output
+          echo "$matrix_json" > /tmp/matrix.json
+          echo "matrix<<EOF" >> $GITHUB_OUTPUT
+          cat /tmp/matrix.json >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          # Debug output
+          echo "Changed charts matrix:"
+          echo "$matrix_json" | jq .
+        env:
+          BASE_COMMIT: ${{ needs.sync-upstream.outputs.local-commit }}
+          TARGET_COMMIT: ${{ needs.sync-upstream.outputs.upstream-commit }}
+
+  build:
+    name: Package and Push ${{ matrix.chart.name }}
+    runs-on: ubuntu-24.04
+    needs: [sync-upstream, discover-charts]
+    if: needs.sync-upstream.outputs.has-changes == 'true' && needs.discover-charts.outputs.charts-count != '0'
+    strategy:
+      fail-fast: true
+      max-parallel: 10
+      matrix:
+        chart: ${{ fromJSON(needs.discover-charts.outputs.matrix) }}
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set up Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: latest
+
+      - name: Verify Chart.yaml exists
+        id: verify-chart
+        run: |
+          chart_file="${{ matrix.chart.chart_file }}"
+          chart_dir="${{ matrix.chart.chart_dir }}"
+
+          if [ -f "$chart_file" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Chart.yaml found: $chart_file"
+            echo "Chart directory: $chart_dir"
+
+            # Verify it's a valid chart by checking for required files
+            if [ -d "$chart_dir/templates" ]; then
+              echo "valid=true" >> $GITHUB_OUTPUT
+              echo "✅ Valid Helm chart structure found"
+            else
+              echo "valid=false" >> $GITHUB_OUTPUT
+              echo "⚠️ Warning: No templates directory found at $chart_dir/templates"
+            fi
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "valid=false" >> $GITHUB_OUTPUT
+            echo "❌ Chart.yaml not found: $chart_file"
+          fi
+
+      - name: Log in to GitHub Container Registry
+        if: steps.verify-chart.outputs.exists == 'true' && steps.verify-chart.outputs.valid == 'true'
+        run: |
+          echo "${{ github.token }}" | helm registry login ghcr.io -u ${{ github.repository_owner }} --password-stdin
+
+      - name: Update chart dependencies
+        if: steps.verify-chart.outputs.exists == 'true' && steps.verify-chart.outputs.valid == 'true' && github.event.inputs.rewrite_dependencies == 'true'
+        run: |
+          chart_dir="${{ matrix.chart.chart_dir }}"
+          chart_file="${{ matrix.chart.chart_file }}"
+          chart_name="${{ matrix.chart.name }}"
+
+          echo "🔄 Rewriting chart dependencies to use our registry (enabled by workflow input)"
+          echo "Chart: $chart_name"
+          echo "Chart file: $chart_file"
+
+          # Backup original Chart.yaml
+          cp "$chart_file" "$chart_file.backup"
+
+          # Replace Bitnami registry URLs with our own
+          # Replace both possible Bitnami registry URLs
+          sed -i 's|oci://registry-1\.docker\.io/bitnamicharts|oci://ghcr.io/${{ github.repository_owner }}/bitnami-oss-charts|g' "$chart_file"
+          sed -i 's|https://charts\.bitnami\.com/bitnami|oci://ghcr.io/${{ github.repository_owner }}/bitnami-oss-charts|g' "$chart_file"
+
+          echo "📝 Updated Chart.yaml dependencies:"
+          if command -v yq >/dev/null 2>&1; then
+            echo "Dependencies in Chart.yaml:"
+            yq eval '.dependencies[] | "- " + .name + " from " + .repository' "$chart_file" || echo "No dependencies found"
+          else
+            echo "Dependencies found:"
+            grep -A 5 "dependencies:" "$chart_file" || echo "No dependencies section found"
+          fi
+
+          # Remove existing Chart.lock if it exists (we'll regenerate it)
+          chart_lock="$chart_dir/Chart.lock"
+          if [ -f "$chart_lock" ]; then
+            echo "🗑️ Removing existing Chart.lock file"
+            rm "$chart_lock"
+          fi
+
+          # Update dependencies if Chart.yaml has dependencies
+          if grep -q "dependencies:" "$chart_file"; then
+            echo "🔄 Updating chart dependencies from our registry"
+
+            # Run helm dependency update to fetch from our registry
+            if helm dependency update "$chart_dir"; then
+              echo "✅ Successfully updated dependencies"
+
+              # Show the new Chart.lock content
+              if [ -f "$chart_dir/Chart.lock" ]; then
+                echo "📋 Generated Chart.lock:"
+                cat "$chart_dir/Chart.lock"
+              fi
+            else
+              echo "⚠️ Warning: helm dependency update failed, but continuing with packaging"
+              echo "This might be expected if dependencies haven't been published yet"
+            fi
+          else
+            echo "ℹ️ No dependencies found in Chart.yaml, skipping dependency update"
+          fi
+
+      - name: Package Helm chart
+        if: steps.verify-chart.outputs.exists == 'true' && steps.verify-chart.outputs.valid == 'true'
+        id: package
+        run: |
+          chart_dir="${{ matrix.chart.chart_dir }}"
+          chart_name="${{ matrix.chart.name }}"
+          chart_version="${{ matrix.chart.version }}"
+
+          echo "📦 Packaging Helm chart: $chart_name v$chart_version"
+          echo "Chart directory: $chart_dir"
+
+          # Package the chart and capture output
+          helm_output=$(helm package "$chart_dir")
+          echo "$helm_output"
+
+          # Extract the package file path from helm output
+          # Output format: "Successfully packaged chart and saved it to: /path/to/chart-version.tgz"
+          package_file=$(echo "$helm_output" | grep -oE '/[^[:space:]]+\.tgz$' | head -1)
+
+          if [ -n "$package_file" ] && [ -f "$package_file" ]; then
+            # Get just the filename for output
+            package_filename=$(basename "$package_file")
+            echo "package-file=$package_filename" >> $GITHUB_OUTPUT
+            echo "package-path=$package_file" >> $GITHUB_OUTPUT
+            echo "✅ Package created successfully: $package_filename"
+
+            # Show package info
+            ls -lh "$package_file"
+          else
+            echo "❌ Failed to extract package file path from helm output"
+            echo "Helm output was: $helm_output"
+            exit 1
+          fi
+
+      - name: Push Helm chart to GHCR
+        if: steps.verify-chart.outputs.exists == 'true' && steps.verify-chart.outputs.valid == 'true' && steps.package.outputs.package-file != ''
+        run: |
+          package_file="${{ steps.package.outputs.package-file }}"
+          package_path="${{ steps.package.outputs.package-path }}"
+          chart_name="${{ matrix.chart.name }}"
+          chart_version="${{ matrix.chart.version }}"
+
+          echo "🚀 Pushing Helm chart to GHCR: $chart_name v$chart_version"
+          echo "Package file: $package_file"
+          echo "Package path: $package_path"
+          echo "Registry: ghcr.io/${{ github.repository_owner }}/bitnami-oss-charts"
+
+          # Push the chart to GHCR using the full path
+          helm push "$package_path" oci://ghcr.io/${{ github.repository_owner }}/bitnami-oss-charts
+
+          echo "✅ Successfully pushed $chart_name:$chart_version to ghcr.io/${{ github.repository_owner }}/bitnami-oss-charts"
+
+      - name: Chart build failed
+        if: failure()
+        run: |
+          echo "❌ CRITICAL: Chart packaging/push failed for ${{ matrix.chart.name }}"
+          echo "Charts must be packaged and pushed successfully - this indicates a real problem"
+          echo "Workflow will be stopped"
+          exit 1
+
+      - name: Chart skipped
+        if: steps.verify-chart.outputs.exists == 'false' || steps.verify-chart.outputs.valid == 'false'
+        run: |
+          echo "⏭️ Skipped chart (Chart.yaml not found or invalid structure):"
+          echo "   📦 Chart: ${{ matrix.chart.name }}"
+          echo "   📁 Directory: ${{ matrix.chart.chart_dir }}"
+          echo "   🏷️  Version: ${{ matrix.chart.version }}"
+
+  build-summary:
+    runs-on: ubuntu-24.04
+    name: Build Summary
+    needs: [sync-upstream, discover-charts, build]
+    if: always()
+    steps:
+      - name: Generate summary
+        run: |
+          echo "# 🚀 Helm Chart Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📊 Build Statistics" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total changed charts:** ${CHART_COUNT}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Sync status:** ${{ needs.sync-upstream.outputs.has-changes == 'true' && '✅ Changes synced from upstream' || '⏭️ No changes detected' }}" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${HAS_CHANGES}" = "false" ]; then
+            echo "- **Build status:** ⏭️ No charts changed - no builds needed" >> $GITHUB_STEP_SUMMARY
+          else
+            # Determine the appropriate build status message
+            if [ "${BUILD_RESULT}" = "success" ]; then
+              echo "- **Build status:** ✅ All chart packages completed successfully" >> $GITHUB_STEP_SUMMARY
+            elif [ "${BUILD_RESULT}" = "failure" ]; then
+              echo "- **Build status:** ❌ Some chart packaging failed - rollback initiated" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- **Build status:** ${BUILD_RESULT}" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Registry Information" >> $GITHUB_STEP_SUMMARY
+          echo "All Helm charts are published to: \`oci://ghcr.io/${{ github.repository_owner }}/bitnami-oss-charts\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📦 Using the Charts" >> $GITHUB_STEP_SUMMARY
+          echo "To use these charts with Helm:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "# Install a chart" >> $GITHUB_STEP_SUMMARY
+          echo "helm install my-release oci://ghcr.io/${{ github.repository_owner }}/bitnami-oss-charts/CHART_NAME" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# Or upgrade to latest version" >> $GITHUB_STEP_SUMMARY
+          echo "helm upgrade my-release oci://ghcr.io/${{ github.repository_owner }}/bitnami-oss-charts/CHART_NAME" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔄 Next Sync" >> $GITHUB_STEP_SUMMARY
+          echo "The next automatic sync is scheduled for tomorrow at midnight UTC." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "*This workflow automatically syncs with [bitnami/charts](https://github.com/bitnami/charts) and packages only changed Helm charts.*" >> $GITHUB_STEP_SUMMARY
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          CHART_COUNT: ${{ needs.discover-charts.outputs.charts-count }}
+          HAS_CHANGES: ${{ needs.sync-upstream.outputs.has-changes }}
+
+      - name: Report status
+        run: |
+          if [ "${HAS_CHANGES}" = "false" ]; then
+            echo "✅ Sync completed successfully - no chart changes detected, no builds needed!"
+          elif [ "${BUILD_RESULT}" = "success" ]; then
+            echo "🎉 All changed Helm chart packages completed successfully!"
+          else
+            echo "❌ Some chart packaging failed. Check the job logs for details and rollback will be initiated."
+          fi
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          CHART_COUNT: ${{ needs.discover-charts.outputs.charts-count }}
+          HAS_CHANGES: ${{ needs.sync-upstream.outputs.has-changes }}
+
+  rollback-on-failure:
+    runs-on: ubuntu-24.04
+    name: Rollback main branch on build failure
+    needs: [sync-upstream, discover-charts, build]
+    if: failure() && needs.sync-upstream.outputs.has-changes == 'true'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          ref: main
+          token: ${{ github.token }}
+
+      - name: Rollback main branch to pre-sync state
+        run: |
+          echo "🔄 CHART PACKAGING FAILURE DETECTED - Rolling back main branch"
+          echo "Original commit (before sync): ${LOCAL_COMMIT}"
+          echo "Current commit (after sync): ${UPSTREAM_COMMIT}"
+
+          # Reset main branch back to the pre-sync commit
+          git reset --hard ${LOCAL_COMMIT}
+
+          # Force push the rollback
+          git push origin main --force
+
+          echo "✅ Successfully rolled back main branch to pre-sync state"
+          echo "Main branch is now at: $(git rev-parse HEAD)"
+        env:
+          LOCAL_COMMIT: ${{ needs.sync-upstream.outputs.local-commit }}
+          UPSTREAM_COMMIT: ${{ needs.sync-upstream.outputs.upstream-commit }}
+
+      - name: Add rollback comment to summary
+        run: |
+          echo "# ⚠️ BUILD FAILURE - ROLLBACK PERFORMED" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔄 Rollback Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Reason**: Chart packaging failure detected" >> $GITHUB_STEP_SUMMARY
+          echo "- **Action**: Main branch rolled back to pre-sync state" >> $GITHUB_STEP_SUMMARY
+          echo "- **Previous commit**: \`${LOCAL_COMMIT}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Reverted from**: \`${UPSTREAM_COMMIT}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📋 Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Check the chart packaging logs to identify the failure" >> $GITHUB_STEP_SUMMARY
+          echo "2. The main branch has been restored to a working state" >> $GITHUB_STEP_SUMMARY
+          echo "3. The problematic upstream changes were not permanently synced" >> $GITHUB_STEP_SUMMARY
+          echo "4. The next sync will retry when upstream issues are resolved" >> $GITHUB_STEP_SUMMARY
+
+        env:
+          LOCAL_COMMIT: ${{ needs.sync-upstream.outputs.local-commit }}
+          UPSTREAM_COMMIT: ${{ needs.sync-upstream.outputs.upstream-commit }}
