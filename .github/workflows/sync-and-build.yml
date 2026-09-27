@@ -28,7 +28,7 @@ concurrency:
 jobs:
   ## Always automatically keep `main` in sync with `upstream/main`
   sync-upstream:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     name: Sync with upstream
     outputs:
       has-changes: ${{ steps.sync.outputs.has-changes }}
@@ -200,7 +200,7 @@ jobs:
 
   build:
     name: Package and Push ${{ matrix.chart.name }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     needs: sync-upstream
     if: needs.sync-upstream.outputs.has-changes == 'true' && needs.sync-upstream.outputs.charts-count != '0'
     strategy:
@@ -410,7 +410,7 @@ jobs:
           echo "   🏷️  Version: ${{ matrix.chart.version }}"
 
   build-summary:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     name: Build Summary
     needs: [sync-upstream, build]
     if: always()
@@ -475,7 +475,7 @@ jobs:
           HAS_CHANGES: ${{ needs.sync-upstream.outputs.has-changes }}
 
   rollback-on-failure:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     name: Rollback main branch on build failure
     needs: [sync-upstream, build]
     if: failure() && needs.sync-upstream.outputs.has-changes == 'true'
